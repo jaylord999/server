@@ -183,6 +183,14 @@ Client A                          Server                              Client B
 
 > Render expects the app to bind to `0.0.0.0` and use the injected `PORT`.
 > Both are already handled by this project.
+>
+> **Why the build works on Render:** Render sets `NODE_ENV=production`, which makes
+> `npm install` skip `devDependencies` by default. The TypeScript build toolchain
+> (`typescript`, `@types/node`, `@types/ws`) is therefore kept in `dependencies`
+> (only `tsx`, used purely for local dev/tests, stays in `devDependencies`), so
+> `npm run build` always has what it needs. The tsconfig uses the modern
+> `module: "node16"` / `moduleResolution: "node16"` settings rather than the
+> removed `node10` resolution.
 
 ### Local WebSocket URL
 
