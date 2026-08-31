@@ -1,0 +1,32 @@
+# Render Blueprint for DefenderServer.
+#
+# This lets you deploy (or re-create) the service with one click:
+#   1. On Render: New + -> Blueprint -> select this repository.
+#   2. Render reads render.yaml and provisions the Web Service below.
+#
+# These are also the exact settings to enter manually on a Web Service.
+# The build command self-installs dependencies (including dev/toolchain deps),
+# so it works even if Render's separate install step is skipped or misconfigured.
+services:
+  - type: web
+    name: defender-server
+    runtime: node
+    plan: free
+    buildCommand: npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # Render sets NODE_ENV=production on Node services by default; explicit
+      # for clarity. PORT is injected automatically - do NOT set it here.
+      - key: NODE_ENV
+        value: production
+      # Optional tunables (defaults are fine). Uncomment to override:
+      # - key: TICK_RATE
+      #   value: "20"
+      # - key: HEARTBEAT_INTERVAL_MS
+      #   value: "15000"
+      # - key: HEARTBEAT_TIMEOUT_MS
+      #   value: "45000"
+      # - key: GAME_TIME_LIMIT_SECONDS
+      #   value: "300"

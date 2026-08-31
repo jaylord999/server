@@ -184,13 +184,24 @@ Client A                          Server                              Client B
 > Render expects the app to bind to `0.0.0.0` and use the injected `PORT`.
 > Both are already handled by this project.
 >
-> **Why the build works on Render:** Render sets `NODE_ENV=production`, which makes
-> `npm install` skip `devDependencies` by default. The TypeScript build toolchain
-> (`typescript`, `@types/node`, `@types/ws`) is therefore kept in `dependencies`
-> (only `tsx`, used purely for local dev/tests, stays in `devDependencies`), so
-> `npm run build` always has what it needs. The tsconfig uses the modern
-> `module: "node16"` / `moduleResolution: "node16"` settings rather than the
-> removed `node10` resolution.
+> **Why the build is self-contained:** Render sets `NODE_ENV=production`, which
+> makes a plain `npm install` skip `devDependencies`. The `build` script
+> therefore runs `npm install --include=dev && tsc -p tsconfig.json`, so the
+> TypeScript toolchain (`typescript`, `@types/node`, `@types/ws`) is always
+> present during the build - even if Render's separate install step is skipped.
+> The tsconfig uses the modern `module: "node16"` / `moduleResolution: "node16"`
+> settings rather than the removed `node10` resolution.
+>
+> **Exact Render settings (also declared in `render.yaml`):**
+>
+> | Field | Value |
+> | --- | --- |
+> | Install Command | `npm install --include=dev` |
+> | Build Command | `npm run build` |
+> | Start Command | `npm start` |
+> | Health Check Path | `/health` |
+>
+> To deploy via blueprint: **New + → Blueprint → select this repository**.
 
 ### Local WebSocket URL
 
