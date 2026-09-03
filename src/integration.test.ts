@@ -126,7 +126,7 @@ test('end-to-end: health, welcome, identify, matchmaking, room, inputs, cleanup'
     const notFound = await fetch(`${base}/nope`);
     assert.equal(notFound.status, 404);
 
-    // --- connection lifecycle: welcome + identify ------------------------
+    // --- connection lifecycle: A connects + identifies (only A online) ------
     const a = await createClient(wsUrl);
     const welcomeA = await a.waitFor((m) => m.type === 'welcome');
     assert.equal(welcomeA.data.protocolVersion, 1);
@@ -137,12 +137,6 @@ test('end-to-end: health, welcome, identify, matchmaking, room, inputs, cleanup'
     assert.equal(identifiedA.requestId, 'id-a');
     const playerA = identifiedA.data.playerId;
 
-    const b = await createClient(wsUrl);
-    await b.waitFor((m) => m.type === 'welcome');
-    b.send({ type: 'identify', data: { clientVersion: '0.1.0' } });
-    const identifiedB = await b.waitFor((m) => m.type === 'identified');
-    const playerB = identifiedB.data.playerId;
-
     // --- security: unidentified client is rejected ------------------------
     const c = await createClient(wsUrl);
     await c.waitFor((m) => m.type === 'welcome');
@@ -151,7 +145,8 @@ test('end-to-end: health, welcome, identify, matchmaking, room, inputs, cleanup'
     assert.equal(notIdentified.data.code, 'NOT_IDENTIFIED');
     await c.close();
 
-    // --- matchmaking -------------------------------------------------------
+    // --- matchmaking TEST 2: no available defender yet ----------------------
+    // A is the only player, so find_match must NOT fabricate an opponent.
     a.send({ type: 'find_match', data: {} });
     const searchingA = await a.waitFor((m) => m.type === 'match_searching');
     assert.equal(searchingA.data.position, 1);
@@ -166,8 +161,16 @@ test('end-to-end: health, welcome, identify, matchmaking, room, inputs, cleanup'
     const unknownErr = await a.waitFor((m) => m.type === 'error' && m.data.code === 'UNKNOWN_MESSAGE');
     assert.equal(unknownErr.data.code, 'UNKNOWN_MESSAGE');
 
-    // Second player queues -> match created deterministically (A = attacker)
-    b.send({ type: 'find_match', data: {} });
+    // --- matchmaking TEST 1: B arrives AVAILABLE (no FIND ENEMY) -------------
+    // A defender appears: B connects and identifies. The server should match the
+    // waiting attacker A against the newly AVAILABLE player B WITHOUT B pressing
+    // find_match. A = ATTACKER, B = DEFENDER.
+    const b = await createClient(wsUrl);
+    await b.waitFor((m) => m.type === 'welcome');
+    b.send({ type: 'identify', data: { clientVersion: '0.1.0' } });
+    const identifiedB = await b.waitFor((m) => m.type === 'identified');
+    const playerB = identifiedB.data.playerId;
+
     const matchA = await a.waitFor((m) => m.type === 'match_found');
     const matchB = await b.waitFor((m) => m.type === 'match_found');
     assert.equal(matchA.data.role, 'attacker');
@@ -219,10 +222,14 @@ test('end-to-end: power, turret, movement, firing and disconnect cleanup', async
     b.send({ type: 'identify', data: { clientVersion: '0.1.0' } });
     await b.waitFor((m) => m.type === 'identified');
 
+    // Only the attacker (A) presses FIND ENEMY; the server matches the already
+    // AVAILABLE player B as the defender automatically (B never presses FIND ENEMY).
     a.send({ type: 'find_match', data: {} });
-    await a.waitFor((m) => m.type === 'match_searching');
-    b.send({ type: 'find_match', data: {} });
+    const matchA = await a.waitFor((m) => m.type === 'match_found');
     const matchB = await b.waitFor((m) => m.type === 'match_found');
+    assert.equal(matchA.data.role, 'attacker');
+    assert.equal(matchB.data.role, 'defender');
+    assert.equal(matchA.data.roomId, matchB.data.roomId);
     const roomId = matchB.data.roomId;
 
     // --- power allocation (server-authoritative) ----------------------------
@@ -258,7 +265,7 @@ test('end-to-end: power, turret, movement, firing and disconnect cleanup', async
     assert.equal(playerRoleErr.data.code, 'INVALID_INPUT');
 
     a.send({ type: 'player_input', data: { throttle: 1, pitch: 0, yaw: 0 } });
-    await a.waitFor((m) => m.type === 'game_state' && m.data.snapshot.attacker.aircraftPosition.z > 0, 3000);
+    await a.waitFor((m) => m.type === 'game_state' && m.data.snapshot.attacker.aircraftPosition.z > -180, 3000);
 
     // --- firing: ammo consumed server-side, cooldown enforced ------------------
     a.send({ type: 'fire_weapon', data: { weapon: 'bullet' } });
@@ -273,8 +280,8 @@ test('end-to-end: power, turret, movement, firing and disconnect cleanup', async
     assert.equal(cooldownErr.data.code, 'WEAPON_UNAVAILABLE');
 
     b.send({ type: 'fire_weapon', data: { weapon: 'bullet' } });
-    const defenderFireErr = await b.waitFor((m) => m.type === 'error');
-    assert.equal(defenderFireErr.data.code, 'INVALID_INPUT');
+    const defenderFired = await b.waitFor((m) => m.type === 'weapon_fired' && m.data.shooterRole === 'defender');
+    assert.equal(defenderFired.data.shooterRole, 'defender');
 
     // --- room state on the server ---------------------------------------------
     assert.ok(handle.roomManager.getRoom(roomId));
@@ -296,6 +303,86 @@ test('end-to-end: power, turret, movement, firing and disconnect cleanup', async
     assert.equal(handle.connectionManager.size(), 0);
   } finally {
     await handle.stop();
+  }
+});
+
+test('real two-client battle: both sides damage each other and the winner is broadcast', async () => {
+  process.env.BATTLE_RESULT_HOLD_MS = '600';
+  const handle = await startServer(
+    loadConfig({
+      PORT: '0',
+      HEARTBEAT_INTERVAL_MS: '10000',
+      HEARTBEAT_TIMEOUT_MS: '30000',
+      TICK_RATE: '20',
+    }),
+  );
+  const wsUrl = `ws://127.0.0.1:${handle.port}`;
+
+  try {
+    const a = await createClient(wsUrl); // attacker (searching)
+    const b = await createClient(wsUrl); // defender (available target)
+
+    await a.waitFor((m) => m.type === 'welcome');
+    await b.waitFor((m) => m.type === 'welcome');
+
+    a.send({ type: 'identify', data: { clientVersion: 'test' } });
+    b.send({ type: 'identify', data: { clientVersion: 'test' } });
+    await a.waitFor((m) => m.type === 'identified');
+    await b.waitFor((m) => m.type === 'identified');
+
+    // b is now AVAILABLE; a searches and the server matches them.
+    a.send({ type: 'find_match', data: {} });
+    const aJoin = await a.waitFor((m) => m.type === 'room_joined');
+    const bJoin = await b.waitFor((m) => m.type === 'room_joined');
+    assert.equal(aJoin.data.role, 'attacker');
+    assert.equal(bJoin.data.role, 'defender');
+    const roomId = aJoin.data.roomId;
+    assert.equal(bJoin.data.roomId, roomId);
+
+    // Battle is authoritative once game_state flows.
+    await a.waitFor((m) => m.type === 'game_state' && m.data.snapshot.gameStarted === true);
+
+    // Defender aims its turret at the starting attacker (rotation 0 faces -Z).
+    b.send({ type: 'turret_input', data: { rotation: 0, barrel: 0 } });
+
+    // Defender fires -> server lands a hit and broadcasts damage to BOTH.
+    b.send({ type: 'fire_weapon', data: { weapon: 'bullet' } });
+    const dmgA = await a.waitFor((m) => m.type === 'damage' && m.data.targetRole === 'attacker');
+    const dmgB = await b.waitFor((m) => m.type === 'damage' && m.data.targetRole === 'attacker');
+    assert.ok(dmgA.data.amount >= 10);
+    assert.ok(dmgB.data.amount >= 10);
+
+    // Attacker fires at the base (default heading faces the base) -> base damaged.
+    a.send({ type: 'fire_weapon', data: { weapon: 'bullet' } });
+    const dmgDef = await a.waitFor((m) => m.type === 'damage' && m.data.targetRole === 'defender');
+    assert.ok(dmgDef.data.amount >= 10);
+
+    // Decide the outcome through the authoritative state, then confirm the
+    // battle_finished result reaches BOTH clients over the wire.
+    const room = handle.roomManager.getRoom(roomId)!;
+    room.state.applyDamage('attacker', 9999);
+    assert.equal(room.state.winner, 'defender');
+
+    // Wait out the defender gun cooldown so the trigger shot is accepted.
+    await new Promise((r) => setTimeout(r, 500));
+    b.send({ type: 'fire_weapon', data: { weapon: 'bullet' } });
+    const finishA = await a.waitFor((m) => m.type === 'battle_finished', 4000);
+    const finishB = await b.waitFor((m) => m.type === 'battle_finished', 4000);
+    assert.equal(finishA.data.winner, 'defender');
+    assert.equal(finishB.data.winner, 'defender');
+
+    // A player leaves -> both are returned to AVAILABLE and the room is removed.
+    a.send({ type: 'leave_room', data: {} });
+    await a.waitFor((m) => m.type === 'room_left');
+    await b.waitFor((m) => m.type === 'room_left');
+    assert.equal(handle.roomManager.size(), 0);
+
+    await a.close();
+    await b.close();
+    await new Promise((r) => setTimeout(r, 150));
+  } finally {
+    await handle.stop();
+    delete process.env.BATTLE_RESULT_HOLD_MS;
   }
 });
 

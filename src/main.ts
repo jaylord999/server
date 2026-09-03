@@ -1,6 +1,6 @@
 import http from 'http';
 import { randomUUID } from 'crypto';
-import { WebSocketServer } from 'ws';
+import { WebSocket, WebSocketServer } from 'ws';
 import 'dotenv/config';
 
 import { loadConfig, ServerConfig } from './game/GameConfig';
@@ -106,6 +106,10 @@ export async function startServer(config: ServerConfig = loadConfig()): Promise<
         }
       }
 
+      // The freed opponent (or this player's departure) may let a waiting
+      // attacker be matched, so re-run the matchmaking pump.
+      pumpMatchmaking();
+
       playerManager.remove(playerId);
     }
 
@@ -188,6 +192,9 @@ export async function startServer(config: ServerConfig = loadConfig()): Promise<
       connectionId,
       createServerMessage(ServerMessageType.IDENTIFIED, { playerId: player.playerId }, message.requestId),
     );
+    // This player is now ONLINE/AVAILABLE - a searching attacker may be waiting,
+    // so try to satisfy the matchmaking queue (this defender never pressed FIND ENEMY).
+    pumpMatchmaking();
   });
 
   router.register(ClientMessageType.PING, (connectionId, message) => {
@@ -217,21 +224,31 @@ export async function startServer(config: ServerConfig = loadConfig()): Promise<
       sendError(connectionId, ErrorCode.ALREADY_IN_ROOM, 'You are already in a room.', message.requestId);
       return;
     }
-    if (matchmaking.isWaiting(player.playerId)) {
-      sendError(connectionId, ErrorCode.ALREADY_IN_QUEUE, 'You are already in the matchmaking queue.', message.requestId);
+    if (player.state !== 'identified') {
+      // Only an ONLINE/AVAILABLE player may start a search. A player who is
+      // already searching (or otherwise busy) must not start a second one.
+      if (matchmaking.isSearching(player.playerId)) {
+        sendError(connectionId, ErrorCode.ALREADY_IN_QUEUE, 'You are already searching for a target.', message.requestId);
+      } else {
+        sendError(connectionId, ErrorCode.ALREADY_IN_ROOM, 'You are not available to search.', message.requestId);
+      }
       return;
     }
-    if (!matchmaking.enqueue(player.playerId)) {
-      sendError(connectionId, ErrorCode.ALREADY_IN_QUEUE, 'Could not join the matchmaking queue.', message.requestId);
-      return;
-    }
+
+    // This player becomes the ATTACKER / searching player.
     playerManager.setState(player.playerId, 'in_queue');
-    log('MATCHMAKING', `Player entered queue (player=${player.playerId})`);
-    connectionManager.send(
-      connectionId,
-      createServerMessage(ServerMessageType.MATCH_SEARCHING, { position: matchmaking.size() }, message.requestId),
-    );
-    tryCreateMatch();
+    matchmaking.search(player.playerId);
+    log('MATCHMAKING', `Player ${player.playerId} searching for target`);
+
+    // Try to match immediately against an already-available defender.
+    const matched = tryMatchAttacker(player.playerId);
+    if (!matched) {
+      log('MATCHMAKING', `Searching available defenders for Player ${player.playerId}`);
+      connectionManager.send(
+        connectionId,
+        createServerMessage(ServerMessageType.MATCH_SEARCHING, { position: matchmaking.size() }, message.requestId),
+      );
+    }
   });
 
   router.register(ClientMessageType.CANCEL_MATCH, (connectionId, message) => {
@@ -245,7 +262,7 @@ export async function startServer(config: ServerConfig = loadConfig()): Promise<
       return;
     }
     playerManager.setState(player.playerId, 'identified');
-    log('MATCHMAKING', `Player left queue (player=${player.playerId})`);
+    log('MATCHMAKING', `Player ${player.playerId} cancelled search (now AVAILABLE)`);
     connectionManager.send(
       connectionId,
       createServerMessage(
@@ -254,6 +271,9 @@ export async function startServer(config: ServerConfig = loadConfig()): Promise<
         message.requestId,
       ),
     );
+    // The cancelled player is available again and may be selected as a defender
+    // by a searching attacker who was already waiting.
+    pumpMatchmaking();
   });
 
   router.register(ClientMessageType.LEAVE_ROOM, (connectionId, message) => {
@@ -290,6 +310,8 @@ export async function startServer(config: ServerConfig = loadConfig()): Promise<
         );
       }
     }
+    // Both players are AVAILABLE again; a searching attacker may match the opponent.
+    pumpMatchmaking();
   });
 
 
@@ -352,56 +374,114 @@ export async function startServer(config: ServerConfig = loadConfig()): Promise<
     }
     const parsed = validateFireWeaponData(message.data);
     if (!parsed.ok) {
-      sendError(connectionId, ErrorCode.INVALID_INPUT, parsed.reason, message.requestId);
+      sendError(connectionId, ErrorCode.INVALID_MESSAGE, parsed.reason, message.requestId);
       return;
     }
     const weapon = parsed.value.weapon;
     const state = room.state;
-    const attacker = state.attacker;
     const now = Date.now();
     const role = room.getRole(player.playerId);
-
-    // Server-authoritative checks: role, ammo, cooldown.
-    if (role !== 'attacker') {
-      sendError(connectionId, ErrorCode.INVALID_INPUT, 'Only the attacker can fire weapons in this milestone.', message.requestId);
+    if (!role) {
+      sendError(connectionId, ErrorCode.NOT_IN_ROOM, 'You must be in a room to fire weapons.', message.requestId);
       return;
     }
+
+    // Primary gun: BOTH roles may fire bullets. The server validates facing,
+    // range, cooldown and (for the attacker) ammo, resolves damage and returns
+    // a replicated shot event. No client decides whether a shot lands.
     if (weapon === 'bullet') {
-      if (attacker.ammo <= 0) {
+      if (role === 'attacker' && state.attacker.ammo <= 0) {
         sendError(connectionId, ErrorCode.WEAPON_UNAVAILABLE, 'No ammo available.', message.requestId);
         return;
       }
-      if (now - state.lastBulletFiredAt < config.weaponCooldownMs) {
+      const result = state.attemptBullet(role, now);
+      if (!result) {
         sendError(connectionId, ErrorCode.WEAPON_UNAVAILABLE, 'Weapon is on cooldown.', message.requestId);
         return;
       }
-      state.lastBulletFiredAt = now;
-      attacker.ammo -= 1;
-    } else if (weapon === 'missile') {
-      if (attacker.missiles <= 0) {
-        sendError(connectionId, ErrorCode.WEAPON_UNAVAILABLE, 'No missiles available.', message.requestId);
-        return;
+
+      if (role === 'attacker') {
+        state.attacker.ammo -= 1;
+        const resources = createServerMessage(ServerMessageType.RESOURCE_UPDATE, {
+          ammo: state.attacker.ammo,
+          missiles: state.attacker.missiles,
+          materials: state.materials,
+        });
+        connectionManager.sendToPlayer(room.attackerPlayerId, resources);
+        connectionManager.sendToPlayer(room.defenderPlayerId, resources);
       }
-      if (now - state.lastMissileFiredAt < config.weaponCooldownMs * 3) {
-        sendError(connectionId, ErrorCode.WEAPON_UNAVAILABLE, 'Missile launcher is on cooldown.', message.requestId);
-        return;
+
+      const shot = createServerMessage(ServerMessageType.WEAPON_FIRED, {
+        roomId: room.roomId,
+        playerId: player.playerId,
+        shooterRole: role,
+        weapon: 'bullet',
+        projectileId: result.shot.projectileId,
+        muzzle: result.shot.muzzle,
+        dir: result.shot.dir,
+        hit: result.shot.hit,
+        travelDistance: result.shot.travelDistance,
+        travelMs: result.shot.travelMs,
+        targetPlayerId: result.shot.targetPlayerId,
+      });
+      connectionManager.sendToPlayer(room.attackerPlayerId, shot);
+      connectionManager.sendToPlayer(room.defenderPlayerId, shot);
+
+      if (result.damage) {
+        const dmg = createServerMessage(ServerMessageType.DAMAGE, {
+          targetRole: result.damage.targetRole,
+          targetId: result.damage.targetRole === 'attacker' ? room.attackerPlayerId : room.defenderPlayerId,
+          amount: result.damage.amount,
+          remainingHealth: result.damage.remainingHealth,
+          remainingShield: result.damage.remainingShield,
+        });
+        connectionManager.sendToPlayer(room.attackerPlayerId, dmg);
+        connectionManager.sendToPlayer(room.defenderPlayerId, dmg);
       }
-      state.lastMissileFiredAt = now;
-      attacker.missiles -= 1;
+
+      // Reflect the latest authoritative health/ammo promptly.
+      broadcastGameState(room);
+
+      if (state.winner) {
+        finishBattle(room);
+      }
+      return;
     }
+
+    // Missile launcher: attacker-only for now (authority stubbed, no damage yet).
+    if (role !== 'attacker') {
+      sendError(connectionId, ErrorCode.INVALID_INPUT, 'Only the attacker can fire missiles in this milestone.', message.requestId);
+      return;
+    }
+    if (state.attacker.missiles <= 0) {
+      sendError(connectionId, ErrorCode.WEAPON_UNAVAILABLE, 'No missiles available.', message.requestId);
+      return;
+    }
+    if (now - state.lastMissileFiredAt < config.weaponCooldownMs * 3) {
+      sendError(connectionId, ErrorCode.WEAPON_UNAVAILABLE, 'Missile launcher is on cooldown.', message.requestId);
+      return;
+    }
+    state.lastMissileFiredAt = now;
+    state.attacker.missiles -= 1;
 
     const fired = createServerMessage(ServerMessageType.WEAPON_FIRED, {
       roomId: room.roomId,
       playerId: player.playerId,
+      shooterRole: role,
       weapon,
       projectileId: randomUUID(),
+      muzzle: { ...state.attacker.aircraftPosition },
+      dir: { x: 0, y: 0, z: 0 },
+      hit: false,
+      travelDistance: 0,
+      travelMs: 0,
     });
     connectionManager.sendToPlayer(room.attackerPlayerId, fired);
     connectionManager.sendToPlayer(room.defenderPlayerId, fired);
 
     const resources = createServerMessage(ServerMessageType.RESOURCE_UPDATE, {
-      ammo: attacker.ammo,
-      missiles: attacker.missiles,
+      ammo: state.attacker.ammo,
+      missiles: state.attacker.missiles,
       materials: state.materials,
     });
     connectionManager.sendToPlayer(room.attackerPlayerId, resources);
@@ -435,46 +515,85 @@ export async function startServer(config: ServerConfig = loadConfig()): Promise<
     connectionManager.sendToPlayer(room.defenderPlayerId, powerUpdate);
   });
 
-  // --- matchmaking ---------------------------------------------------------
+  // --- matchmaking (ATTACKER SEARCH -> AVAILABLE DEFENDER POOL) --------------
 
-  function tryCreateMatch(): void {
-    const pair = matchmaking.pollMatch();
-    if (!pair) {
+  /**
+   * Finds an eligible AVAILABLE defender for a searching attacker. A defender
+   * must be a *different* player who is connected, identified, not already in a
+   * room, and not itself searching / attacking / under attack. The attacker (who
+   * is in the 'in_queue' state) is never eligible for itself.
+   */
+  function findAvailableDefender(attackerPlayerId: string): string | null {
+    for (const player of playerManager.list()) {
+      if (player.playerId === attackerPlayerId) {
+        continue;
+      }
+      // 'identified' == ONLINE/AVAILABLE (connected, not searching, not in room).
+      if (player.state !== 'identified') {
+        continue;
+      }
+      if (player.roomId !== null) {
+        continue;
+      }
+      const connection = connectionManager.getByPlayerId(player.playerId);
+      if (!connection || connection.socket.readyState !== WebSocket.OPEN) {
+        continue;
+      }
+      return player.playerId;
+    }
+    return null;
+  }
+
+  /**
+   * Creates a room pairing the searching player (ATTACKER) with the chosen
+   * available player (DEFENDER), updates both server-side states, and notifies
+   * both clients with `match_found` then `room_joined`, followed by `game_state`.
+   */
+  function createMatch(attackerPlayerId: string, defenderPlayerId: string): void {
+    const attacker = playerManager.getById(attackerPlayerId);
+    const defender = playerManager.getById(defenderPlayerId);
+    if (!attacker || !defender) {
       return;
     }
 
-    const room = roomManager.createRoom(pair.attackerPlayerId, pair.defenderPlayerId, {
+    const room = roomManager.createRoom(attackerPlayerId, defenderPlayerId, {
       maxPower: config.maxPower,
       gameTimeLimitSeconds: config.gameTimeLimitSeconds,
       maxPlayerSpeed: config.maxPlayerSpeed,
     });
 
-    playerManager.setRoom(pair.attackerPlayerId, room.roomId);
-    playerManager.setState(pair.attackerPlayerId, 'in_room');
-    playerManager.setRoom(pair.defenderPlayerId, room.roomId);
-    playerManager.setState(pair.defenderPlayerId, 'in_room');
+    playerManager.setRoom(attackerPlayerId, room.roomId);
+    playerManager.setState(attackerPlayerId, 'in_room');
+    playerManager.setRoom(defenderPlayerId, room.roomId);
+    playerManager.setState(defenderPlayerId, 'in_room');
     room.start();
 
-    log('MATCHMAKING', `Match created (room=${room.roomId})`);
+    log('MATCHMAKING', `Match created: ${room.roomId}`);
     log('ROOM', `Room ${room.roomId} created`);
-    log('ROOM', `Attacker joined (player=${pair.attackerPlayerId})`);
-    log('ROOM', `Defender joined (player=${pair.defenderPlayerId})`);
+    log('MATCHMAKING', `${attackerPlayerId} = ATTACKER`);
+    log('MATCHMAKING', `${defenderPlayerId} = DEFENDER`);
 
-    const attackerConnectionId = playerManager.getById(pair.attackerPlayerId)?.connectionId;
-    const defenderConnectionId = playerManager.getById(pair.defenderPlayerId)?.connectionId;
+    const attackerConnectionId = attacker.connectionId;
+    const defenderConnectionId = defender.connectionId;
 
     if (attackerConnectionId) {
-      connectionManager.send(attackerConnectionId, createServerMessage(ServerMessageType.MATCH_FOUND, { roomId: room.roomId, role: 'attacker' }));
+      connectionManager.send(
+        attackerConnectionId,
+        createServerMessage(ServerMessageType.MATCH_FOUND, { roomId: room.roomId, role: 'attacker' }),
+      );
     }
     if (defenderConnectionId) {
-      connectionManager.send(defenderConnectionId, createServerMessage(ServerMessageType.MATCH_FOUND, { roomId: room.roomId, role: 'defender' }));
+      connectionManager.send(
+        defenderConnectionId,
+        createServerMessage(ServerMessageType.MATCH_FOUND, { roomId: room.roomId, role: 'defender' }),
+      );
     }
 
     if (attackerConnectionId) {
       connectionManager.send(attackerConnectionId, createServerMessage(ServerMessageType.ROOM_JOINED, {
         roomId: room.roomId,
         role: 'attacker',
-        opponentPlayerId: pair.defenderPlayerId,
+        opponentPlayerId: defenderPlayerId,
         gameStarted: true,
       }));
     }
@@ -482,7 +601,7 @@ export async function startServer(config: ServerConfig = loadConfig()): Promise<
       connectionManager.send(defenderConnectionId, createServerMessage(ServerMessageType.ROOM_JOINED, {
         roomId: room.roomId,
         role: 'defender',
-        opponentPlayerId: pair.attackerPlayerId,
+        opponentPlayerId: attackerPlayerId,
         gameStarted: true,
       }));
     }
@@ -490,9 +609,76 @@ export async function startServer(config: ServerConfig = loadConfig()): Promise<
     broadcastGameState(room);
   }
 
+  /**
+   * Tries to match one searching (attacker) player against an available defender.
+   * Returns true if a match was created; otherwise the attacker keeps waiting.
+   */
+  function tryMatchAttacker(attackerPlayerId: string): boolean {
+    const defenderPlayerId = findAvailableDefender(attackerPlayerId);
+    if (!defenderPlayerId) {
+      log('MATCHMAKING', `No available defender for Player ${attackerPlayerId}`);
+      return false;
+    }
+    log('MATCHMAKING', `Candidate found: Player ${defenderPlayerId}`);
+    matchmaking.remove(attackerPlayerId);
+    createMatch(attackerPlayerId, defenderPlayerId);
+    return true;
+  }
+
+  /**
+   * Matches as many currently-waiting attackers as possible (FIFO order). Called
+   * after any event that can make a defender newly available (identify, cancel,
+   * room teardown, disconnect). Runs synchronously within a single Node.js
+   * event-loop turn, so a defender claimed by one attacker is set to 'in_room'
+   * (removed from the pool) before the next attacker is considered - this makes
+   * the selection atomic and prevents two attackers acquiring the same defender.
+   */
+  function pumpMatchmaking(): void {
+    for (const attackerPlayerId of matchmaking.waiting()) {
+      if (!matchmaking.isSearching(attackerPlayerId)) {
+        continue; // cancelled/removed during an earlier iteration of this call
+      }
+      if (!tryMatchAttacker(attackerPlayerId)) {
+        break; // no available defender remains for any waiting attacker
+      }
+    }
+  }
+
   // --- authoritative game loop --------------------------------------------
 
-  function endRoom(room: GameRoom, reason: 'time_limit'): void {
+  const RESULT_HOLD_MS = Number(process.env.BATTLE_RESULT_HOLD_MS ?? 8000);
+
+  /**
+   * The room has a decisive winner. Broadcast the result to both players, then
+   * schedule an automatic teardown (returns both to AVAILABLE) unless a player
+   * leaves first.
+   */
+  function finishBattle(room: GameRoom): void {
+    const winner = room.state.winner;
+    if (!winner) {
+      return;
+    }
+    const result = createServerMessage(ServerMessageType.BATTLE_FINISHED, {
+      roomId: room.roomId,
+      winner,
+      gameTime: room.state.gameTime,
+      attackerHealth: room.state.attacker.health,
+      defenderHealth: room.state.defender.health,
+    });
+    connectionManager.sendToPlayer(room.attackerPlayerId, result);
+    connectionManager.sendToPlayer(room.defenderPlayerId, result);
+    log('ROOM', `Room ${room.roomId} battle finished, winner=${winner}`);
+
+    const roomId = room.roomId;
+    setTimeout(() => {
+      const stillThere = roomManager.getRoom(roomId);
+      if (stillThere && stillThere.state.winner) {
+        endRoom(stillThere, 'battle_ended');
+      }
+    }, RESULT_HOLD_MS);
+  }
+
+  function endRoom(room: GameRoom, reason: 'time_limit' | 'battle_ended'): void {
     roomManager.removeRoom(room.roomId);
     for (const playerId of [room.attackerPlayerId, room.defenderPlayerId]) {
       const player = playerManager.getById(playerId);
@@ -506,6 +692,8 @@ export async function startServer(config: ServerConfig = loadConfig()): Promise<
       }
     }
     log('ROOM', `Room ${room.roomId} ended (${reason})`);
+    // Both players are AVAILABLE again after a battle ends.
+    pumpMatchmaking();
   }
 
   const tickTimer = setInterval(() => {
@@ -515,7 +703,11 @@ export async function startServer(config: ServerConfig = loadConfig()): Promise<
       room.lastTickAt = now;
       room.state.update(dt);
       if (room.state.finished) {
-        endRoom(room, 'time_limit');
+        // A decisive winner is handled by finishBattle (broadcast + teardown
+        // timer). Only the time-limit path tears the room down here.
+        if (!room.state.winner) {
+          endRoom(room, 'time_limit');
+        }
         continue;
       }
       if (room.state.gameStarted) {

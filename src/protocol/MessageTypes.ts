@@ -38,6 +38,7 @@ export const ServerMessageType = {
   TURRET_STATE: 'turret_state',
   WEAPON_FIRED: 'weapon_fired',
   DAMAGE: 'damage',
+  BATTLE_FINISHED: 'battle_finished',
   RESOURCE_UPDATE: 'resource_update',
   POWER_UPDATE: 'power_update',
   ERROR: 'error',

@@ -1,7 +1,6 @@
 import type { GameStateSnapshot } from '../game/GameState';
 import type { PowerAllocation } from '../game/PowerAllocation';
 import type { Role } from '../rooms/GameRoom';
-
 /**
  * Server -> client messages. Always built with the shared envelope via
  * `createServerMessage` so the wire format stays consistent.
@@ -58,7 +57,7 @@ export interface RoomJoinedData {
 
 export interface RoomLeftData {
   roomId: string;
-  reason: 'player_left' | 'opponent_left' | 'opponent_disconnected' | 'time_limit';
+  reason: 'player_left' | 'opponent_left' | 'opponent_disconnected' | 'time_limit' | 'battle_ended';
 }
 
 export interface GameStateData {
@@ -76,17 +75,40 @@ export interface TurretStateData {
   heat: number;
 }
 
+export interface ShotVector {
+  x: number;
+  y: number;
+  z: number;
+}
+
 export interface WeaponFiredData {
   roomId: string;
   playerId: string;
+  shooterRole: string;
   weapon: string;
   projectileId: string;
+  muzzle: ShotVector;
+  dir: ShotVector;
+  hit: boolean;
+  travelDistance: number;
+  travelMs: number;
+  targetPlayerId?: string;
 }
 
 export interface DamageData {
+  targetRole: string;
   targetId: string;
   amount: number;
   remainingHealth: number;
+  remainingShield: number;
+}
+
+export interface BattleFinishedData {
+  roomId: string;
+  winner: Role;
+  gameTime: number;
+  attackerHealth: number;
+  defenderHealth: number;
 }
 
 export interface ResourceUpdateData {

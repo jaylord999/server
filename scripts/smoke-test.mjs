@@ -144,13 +144,16 @@ async function run() {
     b.send({ type: 'identify', data: { clientVersion: '0.1.0' } });
     await b.waitFor((m) => m.type === 'identified');
 
-    // --- matchmaking ---
+    // --- matchmaking (attacker search -> available defender) ---
+    // B is already AVAILABLE (identified, ONLINE) and NEVER presses FIND ENEMY.
     a.send({ type: 'find_match', data: {} });
-    await a.waitFor((m) => m.type === 'match_searching');
-    b.send({ type: 'find_match', data: {} });
     const matchA = await a.waitFor((m) => m.type === 'match_found');
     const matchB = await b.waitFor((m) => m.type === 'match_found');
-    check('two-player match created', matchA.data.roomId === matchB.data.roomId && matchA.data.role === 'attacker' && matchB.data.role === 'defender', `room=${matchA.data.roomId}`);
+    check(
+      'attacker matched to an already-available defender',
+      matchA.data.roomId === matchB.data.roomId && matchA.data.role === 'attacker' && matchB.data.role === 'defender',
+      `room=${matchA.data.roomId}`,
+    );
 
     const stateA = await a.waitFor((m) => m.type === 'game_state');
     check('initial game_state broadcast', stateA.data.snapshot.gameStarted === true);
